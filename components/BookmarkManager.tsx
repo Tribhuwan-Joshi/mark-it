@@ -54,7 +54,11 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
           filter: `user_id=eq.${user.id}`,
         },
         (payload) => {
-          setBookmarks((current) => [payload.new as Bookmark, ...current]);
+          setBookmarks((current) => {
+            // Remove temp entries (our own optimistic adds)
+            const withoutTemp = current.filter((b) => !b.id.startsWith("temp-"));
+            return [payload.new as Bookmark, ...withoutTemp];
+          });
         }
       )
       .on(
@@ -65,7 +69,6 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
           table: "bookmarks",
         },
         (payload) => {
-          // Safe: only remove if id matches (idempotent, handles our own deletes)
           setBookmarks((current) => current.filter((b) => b.id !== payload.old.id));
         }
       )
@@ -98,6 +101,16 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
 
     setSubmitting(true);
 
+    const optimisticBookmark: Bookmark = {
+      id: `temp-${Date.now()}`,
+      title: title.trim(),
+      url: url.trim(),
+      user_id: user.id,
+      created_at: new Date().toISOString(),
+    };
+
+    setBookmarks((current) => [optimisticBookmark, ...current]);
+
     const { error } = await supabase
       .from("bookmarks")
       .insert({ title: title.trim(), url: url.trim(), user_id: user.id });
@@ -105,18 +118,20 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
     if (!error) {
       setTitle("");
       setUrl("");
+    } else {
+      setBookmarks((current) => current.filter((b) => b.id !== optimisticBookmark.id));
+      console.error("Insert failed:", error);
     }
+
     setSubmitting(false);
   };
 
   const handleDelete = async (id: string) => {
-    // Optimistic remove → instant UI feedback
     setBookmarks((prev) => prev.filter((b) => b.id !== id));
 
     const { error } = await supabase.from("bookmarks").delete().eq("id", id);
 
     if (error) {
-      // Rollback on failure (rare, but good safety)
       fetchBookmarks();
     }
   };
