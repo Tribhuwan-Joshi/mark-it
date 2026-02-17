@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, FormEvent } from "react";
+import { useEffect, useState, useRef, FormEvent } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { User } from "@supabase/supabase-js";
 import Navbar from "./Navbar";
@@ -19,46 +19,42 @@ interface BookmarkManagerProps {
 }
 
 export default function BookmarkManager({ user }: BookmarkManagerProps) {
-  const supabase = createClient();
+  const supabase = useRef(createClient()).current;
+
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
-  // Fetch existing bookmarks on mount
+  const fetchBookmarks = async () => {
+    const { data } = await supabase
+      .from("bookmarks")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false });
+
+    if (data) setBookmarks(data);
+    setLoading(false);
+  };
+
   useEffect(() => {
-    const fetchBookmarks = async () => {
-      const { data } = await supabase
-        .from("bookmarks")
-        .select("*")
-        .order("created_at", { ascending: false });
-
-      if (data) setBookmarks(data);
-      setLoading(false);
-    };
-
     fetchBookmarks();
   }, []);
 
-  // Subscribe to Realtime changes
   useEffect(() => {
     const channel = supabase
-      .channel("bookmarks-realtime")
+      .channel(`bookmarks-${user.id}`)
       .on(
         "postgres_changes",
         {
           event: "INSERT",
           schema: "public",
           table: "bookmarks",
+          filter: `user_id=eq.${user.id}`,
         },
         (payload) => {
-          const newBookmark = payload.new as Bookmark;
-          setBookmarks((prev) => {
-            // Avoid duplicates
-            if (prev.some((b) => b.id === newBookmark.id)) return prev;
-            return [newBookmark, ...prev];
-          });
+          setBookmarks((current) => [payload.new as Bookmark, ...current]);
         }
       )
       .on(
@@ -69,8 +65,24 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
           table: "bookmarks",
         },
         (payload) => {
-          const deletedId = payload.old.id;
-          setBookmarks((prev) => prev.filter((b) => b.id !== deletedId));
+          // Safe: only remove if id matches (idempotent, handles our own deletes)
+          setBookmarks((current) => current.filter((b) => b.id !== payload.old.id));
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "bookmarks",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          setBookmarks((current) =>
+            current.map((b) =>
+              b.id === payload.new.id ? (payload.new as Bookmark) : b
+            )
+          );
         }
       )
       .subscribe();
@@ -80,35 +92,33 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
     };
   }, [user.id]);
 
-  // Add a new bookmark
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!title.trim() || !url.trim()) return;
 
     setSubmitting(true);
-    const { data, error } = await supabase
-      .from("bookmarks")
-      .insert({ title: title.trim(), url: url.trim(), user_id: user.id })
-      .select()
-      .single();
 
-    if (!error && data) {
-      // Optimistically add it; Realtime will deduplicate
-      setBookmarks((prev) => {
-        if (prev.some((b) => b.id === data.id)) return prev;
-        return [data, ...prev];
-      });
+    const { error } = await supabase
+      .from("bookmarks")
+      .insert({ title: title.trim(), url: url.trim(), user_id: user.id });
+
+    if (!error) {
       setTitle("");
       setUrl("");
     }
     setSubmitting(false);
   };
 
-  // Delete a bookmark
   const handleDelete = async (id: string) => {
-    // Optimistically remove it; Realtime will also fire
+    // Optimistic remove → instant UI feedback
     setBookmarks((prev) => prev.filter((b) => b.id !== id));
-    await supabase.from("bookmarks").delete().eq("id", id);
+
+    const { error } = await supabase.from("bookmarks").delete().eq("id", id);
+
+    if (error) {
+      // Rollback on failure (rare, but good safety)
+      fetchBookmarks();
+    }
   };
 
   return (
@@ -116,7 +126,6 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
       <Navbar user={user} />
 
       <main className="mx-auto w-full max-w-3xl flex-1 px-6 py-10">
-        {/* Add Bookmark Form */}
         <form
           onSubmit={handleSubmit}
           className="mb-10 overflow-hidden rounded-2xl border border-white/[0.06] bg-white/[0.02] p-6"
@@ -149,24 +158,9 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
             >
               {submitting ? (
                 <span className="flex items-center gap-2">
-                  <svg
-                    className="h-4 w-4 animate-spin"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                  >
-                    <circle
-                      className="opacity-25"
-                      cx="12"
-                      cy="12"
-                      r="10"
-                      stroke="currentColor"
-                      strokeWidth="4"
-                    />
-                    <path
-                      className="opacity-75"
-                      fill="currentColor"
-                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                    />
+                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
                   Adding…
                 </span>
@@ -177,52 +171,22 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
           </div>
         </form>
 
-        {/* Bookmarks Grid */}
         {loading ? (
           <div className="flex items-center justify-center py-20">
-            <svg
-              className="h-8 w-8 animate-spin text-indigo-500"
-              viewBox="0 0 24 24"
-              fill="none"
-            >
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="4"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-              />
+            <svg className="h-8 w-8 animate-spin text-indigo-500" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
           </div>
         ) : bookmarks.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-center">
             <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.04]">
-              <svg
-                className="h-8 w-8 text-zinc-600"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={1.5}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z"
-                />
+              <svg className="h-8 w-8 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
               </svg>
             </div>
-            <h3 className="text-lg font-medium text-zinc-300">
-              No bookmarks yet
-            </h3>
-            <p className="mt-1 text-sm text-zinc-500">
-              Add your first bookmark above to get started.
-            </p>
+            <h3 className="text-lg font-medium text-zinc-300">No bookmarks yet</h3>
+            <p className="mt-1 text-sm text-zinc-500">Add your first bookmark above to get started.</p>
           </div>
         ) : (
           <div className="grid gap-3">
@@ -240,10 +204,8 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
         )}
       </main>
 
-      {/* Footer */}
       <footer className="border-t border-white/[0.04] py-6 text-center text-xs text-zinc-600">
-        MarkIt — {bookmarks.length} bookmark{bookmarks.length !== 1 && "s"}{" "}
-        saved
+        MarkIt — {bookmarks.length} bookmark{bookmarks.length !== 1 && "s"} saved
       </footer>
     </div>
   );
