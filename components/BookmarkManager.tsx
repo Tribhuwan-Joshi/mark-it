@@ -45,50 +45,38 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
   useEffect(() => {
     const channel = supabase
       .channel(`bookmarks-${user.id}`)
-      .on(
+      .on<Bookmark>(
         "postgres_changes",
         {
-          event: "INSERT",
+          event: "*",
           schema: "public",
           table: "bookmarks",
           filter: `user_id=eq.${user.id}`,
         },
         (payload) => {
-          setBookmarks((current) => {
-            // Remove temp entries (our own optimistic adds)
-            const withoutTemp = current.filter((b) => !b.id.startsWith("temp-"));
-            return [payload.new as Bookmark, ...withoutTemp];
-          });
+          if (payload.eventType === "INSERT") {
+            setBookmarks((current) => {
+              // Remove any leftover temp entries (our own optimistic adds)
+              const withoutTemp = current.filter((b) => !b.id.startsWith("temp-"));
+              return [payload.new, ...withoutTemp];
+            });
+          } else if (payload.eventType === "DELETE") {
+            setBookmarks((current) =>
+              current.filter((b) => b.id !== payload.old.id)
+            );
+          } else if (payload.eventType === "UPDATE") {
+            setBookmarks((current) =>
+              current.map((b) =>
+                b.id === payload.new.id ? payload.new : b
+              )
+            );
+          }
         }
       )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "bookmarks",
-        },
-        (payload) => {
-          setBookmarks((current) => current.filter((b) => b.id !== payload.old.id));
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "bookmarks",
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          setBookmarks((current) =>
-            current.map((b) =>
-              b.id === payload.new.id ? (payload.new as Bookmark) : b
-            )
-          );
-        }
-      )
-      .subscribe();
+      .subscribe((status) => {
+        console.log("Realtime subscription status:", status);
+        // You can add if (status === 'CLOSED' || status === 'CHANNEL_ERROR') { ... retry logic } later
+      });
 
     return () => {
       supabase.removeChannel(channel);
@@ -127,11 +115,14 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
   };
 
   const handleDelete = async (id: string) => {
+    // Optimistic delete
     setBookmarks((prev) => prev.filter((b) => b.id !== id));
 
     const { error } = await supabase.from("bookmarks").delete().eq("id", id);
 
     if (error) {
+      console.error("Delete failed:", error);
+      // Rollback + refetch on error
       fetchBookmarks();
     }
   };

@@ -1,5 +1,5 @@
 # Mark-It
-
+[Live](https://mark-it-gray.vercel.app/)
 A simple, real-time bookmark manager built with Next.js 16 (App Router).
 
 ## Tech Stack
@@ -17,9 +17,9 @@ A simple, real-time bookmark manager built with Next.js 16 (App Router).
 
 ## Challenges & Solutions
 
-### Real-time Updates failing
+### Real-time deletes not reflecting
 
-Initially, adding a bookmark in one tab didn't show up in others. The database wasn't broadcasting changes. I fixed this by enabling replication on the `bookmarks` table (`alter publication supabase_realtime add table bookmarks;`).
+Adding bookmarks updated other tabs fine but deleting one did not show up until refresh. Supabase ignores filters on DELETE events so my separate DELETE listener was not working properly. I switched to one listener using event * with the user_id filter and handled INSERT UPDATE and DELETE inside the same callback using payload.eventType. Now deletes show up instantly in all tabs without refresh.
 
 ### Hydration Errors
 
