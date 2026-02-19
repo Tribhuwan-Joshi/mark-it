@@ -27,61 +27,111 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
   const fetchBookmarks = async () => {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("bookmarks")
       .select("*")
       .eq("user_id", user.id)
       .order("created_at", { ascending: false });
 
-    if (data) setBookmarks(data);
+    if (!error && data) {
+      setBookmarks(data);
+    }
     setLoading(false);
   };
 
   useEffect(() => {
     fetchBookmarks();
-  }, []);
+  }, [user.id]);
 
   useEffect(() => {
-    const channel = supabase
-      .channel(`bookmarks-${user.id}`)
-      .on<Bookmark>(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "bookmarks",
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          if (payload.eventType === "INSERT") {
-            setBookmarks((current) => {
-              // Remove any leftover temp entries (our own optimistic adds)
-              const withoutTemp = current.filter((b) => !b.id.startsWith("temp-"));
-              return [payload.new, ...withoutTemp];
-            });
-          } else if (payload.eventType === "DELETE") {
-            setBookmarks((current) =>
-              current.filter((b) => b.id !== payload.old.id)
-            );
-          } else if (payload.eventType === "UPDATE") {
-            setBookmarks((current) =>
-              current.map((b) =>
-                b.id === payload.new.id ? payload.new : b
-              )
-            );
+    let isMounted = true;
+
+    const setupRealtime = async () => {
+      // 🔴 CRITICAL FIX: correct session API for supabase-js v2
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      const accessToken = session?.access_token;
+
+      if (accessToken) {
+        supabase.realtime.setAuth(accessToken);
+      }
+
+      // Clean old channel if exists (prevents duplicate subscriptions)
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+      }
+
+      const channel = supabase
+        // 🔴 FIX: Removed private channel (not needed for postgres_changes)
+        .channel(`bookmarks-${user.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "bookmarks",
+            filter: `user_id=eq.${user.id}`, // owner-only realtime
+          },
+          (payload) => {
+            if (!isMounted) return;
+
+            const ev = payload.eventType;
+
+            if (ev === "INSERT" && payload.new) {
+              const newRow = payload.new as Bookmark;
+
+              setBookmarks((current) => {
+                // Remove optimistic temp items & dedupe
+                const filtered = current.filter(
+                  (b) => !b.id.startsWith("temp-") && b.id !== newRow.id
+                );
+                return [newRow, ...filtered];
+              });
+            }
+
+            if (ev === "UPDATE" && payload.new) {
+              const updated = payload.new as Bookmark;
+              setBookmarks((current) =>
+                current.map((b) => (b.id === updated.id ? updated : b))
+              );
+            }
+
+            if (ev === "DELETE") {
+              const oldRow = payload.old as Partial<Bookmark> | null;
+
+              if (oldRow?.id) {
+                setBookmarks((current) =>
+                  current.filter((b) => b.id !== oldRow.id)
+                );
+              } else {
+                // fallback safety
+                fetchBookmarks();
+              }
+            }
           }
-        }
-      )
-      .subscribe((status) => {
-        console.log("Realtime subscription status:", status);
-        // You can add if (status === 'CLOSED' || status === 'CHANNEL_ERROR') { ... retry logic } later
-      });
+        )
+        .subscribe((status) => {
+          console.log("Realtime status:", status);
+        });
+
+      channelRef.current = channel;
+    };
+
+    setupRealtime();
 
     return () => {
-      supabase.removeChannel(channel);
+      isMounted = false;
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
     };
-  }, [user.id]);
+  }, [user.id, supabase]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -99,16 +149,30 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
 
     setBookmarks((current) => [optimisticBookmark, ...current]);
 
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from("bookmarks")
-      .insert({ title: title.trim(), url: url.trim(), user_id: user.id });
+      .insert({
+        title: title.trim(),
+        url: url.trim(),
+        user_id: user.id,
+      })
+      .select()
+      .single();
 
-    if (!error) {
+    if (error) {
+      // rollback optimistic update
+      setBookmarks((current) =>
+        current.filter((b) => b.id !== optimisticBookmark.id)
+      );
+      console.error("Insert failed:", error);
+    } else if (inserted) {
+      setBookmarks((current) =>
+        current.map((b) =>
+          b.id === optimisticBookmark.id ? inserted : b
+        )
+      );
       setTitle("");
       setUrl("");
-    } else {
-      setBookmarks((current) => current.filter((b) => b.id !== optimisticBookmark.id));
-      console.error("Insert failed:", error);
     }
 
     setSubmitting(false);
@@ -118,12 +182,14 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
     // Optimistic delete
     setBookmarks((prev) => prev.filter((b) => b.id !== id));
 
-    const { error } = await supabase.from("bookmarks").delete().eq("id", id);
+    const { error } = await supabase
+      .from("bookmarks")
+      .delete()
+      .eq("id", id);
 
     if (error) {
       console.error("Delete failed:", error);
-      // Rollback + refetch on error
-      fetchBookmarks();
+      fetchBookmarks(); // rollback via refetch
     }
   };
 
@@ -147,7 +213,7 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               required
-              className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm text-white placeholder-zinc-500 outline-none transition-colors focus:border-indigo-500/50 focus:bg-white/[0.06]"
+              className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm text-white outline-none"
             />
             <input
               type="url"
@@ -155,44 +221,23 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               required
-              className="flex-[2] rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm text-white placeholder-zinc-500 outline-none transition-colors focus:border-indigo-500/50 focus:bg-white/[0.06]"
+              className="flex-[2] rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm text-white outline-none"
             />
             <button
               type="submit"
               disabled={submitting}
-              className="cursor-pointer rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 px-6 py-3 text-sm font-medium text-white shadow-lg shadow-indigo-500/25 transition-all duration-200 hover:shadow-xl hover:shadow-indigo-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 px-6 py-3 text-sm font-medium text-white disabled:opacity-50"
             >
-              {submitting ? (
-                <span className="flex items-center gap-2">
-                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                  Adding…
-                </span>
-              ) : (
-                "Add"
-              )}
+              {submitting ? "Adding…" : "Add"}
             </button>
           </div>
         </form>
 
         {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <svg className="h-8 w-8 animate-spin text-indigo-500" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-          </div>
+          <div className="text-center text-white/60">Loading...</div>
         ) : bookmarks.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 text-center">
-            <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.04]">
-              <svg className="h-8 w-8 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-medium text-zinc-300">No bookmarks yet</h3>
-            <p className="mt-1 text-sm text-zinc-500">Add your first bookmark above to get started.</p>
+          <div className="text-center text-zinc-500 py-20">
+            No bookmarks yet
           </div>
         ) : (
           <div className="grid gap-3">
@@ -209,10 +254,6 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
           </div>
         )}
       </main>
-
-      <footer className="border-t border-white/[0.04] py-6 text-center text-xs text-zinc-600">
-        MarkIt — {bookmarks.length} bookmark{bookmarks.length !== 1 && "s"} saved
-      </footer>
     </div>
   );
 }
