@@ -50,7 +50,6 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
     let isMounted = true;
 
     const setupRealtime = async () => {
-      // 🔴 CRITICAL FIX: correct session API for supabase-js v2
       const {
         data: { session },
       } = await supabase.auth.getSession();
@@ -61,13 +60,11 @@ export default function BookmarkManager({ user }: BookmarkManagerProps) {
         supabase.realtime.setAuth(accessToken);
       }
 
-      // Clean old channel if exists (prevents duplicate subscriptions)
       if (channelRef.current) {
         supabase.removeChannel(channelRef.current);
       }
 
       const channel = supabase
-        // 🔴 FIX: Removed private channel (not needed for postgres_changes)
         .channel(`bookmarks-${user.id}`)
         .on(
           "postgres_changes",
